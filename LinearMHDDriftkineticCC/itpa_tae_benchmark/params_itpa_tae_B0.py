@@ -23,6 +23,7 @@ C_FIT = (0.47685, 0.20088, 0.13150, 0.51475)
 # PR #887, issue #889); `--a1` the hole around the axis; `--degree` the spline degrees (as in the ShearAlfven and
 # LinearMHD ITPA examples).
 # `--test-run` selects a small grid and a short run (three saved time steps) for the tests (test_examples.py).
+# `--setup profiling` selects the setup of the profiling runs of submit_LinearMHDDriftkineticCC_scaling.py.
 # Unknown flags are ignored so that a driver can forward other parameters as well.
 # no -h here when imported by another script, which has its own help
 parser = argparse.ArgumentParser(add_help=__name__ == "__main__")
@@ -94,7 +95,7 @@ parser.add_argument(
 )
 parser.add_argument(
     "--parallel-algo",
-    default="discrete_gradient_1st_order_newton",
+    default="discrete_gradient_2nd_order",
     choices=["discrete_gradient_2nd_order", "discrete_gradient_1st_order", "discrete_gradient_1st_order_newton", "rk4"],
     help="Algorithm of the parallel guiding-center push (PushGuidingCenterParallel1form, PushGuidingCenterParallel "
     "with --b-space Hdiv): a discrete gradient (energy "
@@ -122,6 +123,26 @@ parser.add_argument(
     help="Amplitude of the initial m = 10, 11 velocity perturbation (seed of the TAE).",
 )
 parser.add_argument(
+    "--setup",
+    default="example",
+    choices=["example", "profiling"],
+    help="example: the TAE run; profiling: setup of the profiling runs profiled with scope-profiler (the grid, "
+    "space and number of markers of the flags, --profiling-steps steps, solver iterations logged, no restart data).",
+)
+parser.add_argument(
+    "--profiling-steps",
+    type=int,
+    default=50,
+    help="Number of time steps with --setup profiling (default 50); the first one includes one-time work.",
+)
+parser.add_argument(
+    "--num-clones",
+    type=int,
+    default=1,
+    help="Number of clones (default 1): the MPI ranks are split into this many groups, each with the whole FEEC part "
+    "(domain decomposition within the clone) and its share of the markers; e.g. one clone per node.",
+)
+parser.add_argument(
     "--test-run",
     action="store_true",
     help="Small resolution (num_elements = [8, 32, 4], 2000 markers) and a short run with three saved time steps, "
@@ -139,6 +160,14 @@ if args.num_elements is None:
 if args.test_run:
     args.num_elements = [8, 32, 4]
     args.Np = 2000
+profiling = args.setup == "profiling"
+if profiling:
+    # one BLAS/OpenMP thread per MPI rank, set before NumPy is imported: oversubscribed threaded BLAS makes the MPI
+    # timings meaningless (issue #743)
+    import os
+
+    for _var in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ.setdefault(_var, "1")
 
 if args.T_hot != 400.0:
     logging.getLogger("struphy").warning(
@@ -203,7 +232,9 @@ of the paper). The guiding-center pushers use {args.drift_algo} for the drifts (
 plasma are removed (--marker-bc remove) or refilled on the same field line (--marker-bc refill): {args.marker_bc}.
 Filter of the accumulated moments: {args.filter}.
 
-Cost. With 1e5 markers on 4 MPI ranks (dt = 0.25, default pushers), a time step took about 16 s with --b-space Hdiv
+Cost. With 1e5 markers on 4 MPI ranks (dt = 0.25, measured with the earlier Itoh-Abe parallel pusher and a Lie
+splitting of the pushers; the present default pushers cost about the same per step), a time step took about 16 s
+with --b-space Hdiv
 (24 x 96 x 16) and about 19 s with --b-space Hcurl (24 x 44 x 16; about 8 s of it for the mass matrices of the total
 field in the shear Alfven step, nonlinear=True by default; about 11 s with nonlinear=False). The marker noise of
 the magnetization makes the curl-curl solve of the H(curl) step need about 60-70 Hiptmair-Xu iterations instead of
@@ -258,6 +289,7 @@ from struphy import (
     maxwellians,
     perturbations,
 )
+from struphy.linear_algebra.solver import SolverParameters
 
 # ---------------------
 # Instance of the model
@@ -299,11 +331,22 @@ model.energetic_ions.var.save_data = True
 # --------------------------
 
 # Environment options
-env = EnvironmentOptions(out_folders=args.out_folder, save_step=4, sim_folder=args.sim_folder, max_runtime=24 * 60)
+env = EnvironmentOptions(
+    out_folders=args.out_folder,
+    save_step=4,
+    sim_folder=args.sim_folder,
+    max_runtime=24 * 60,
+    save_restart=not profiling,
+    num_clones=args.num_clones,
+)
 
 # Time stepping
 # --test-run: the initial, a middle and a final saved time step
-time_opts = Time(dt=args.dt, Tend=2 * env.save_step * args.dt if args.test_run else args.tend, split_algo="LieTrotter")
+if profiling:
+    tend = round(args.profiling_steps * args.dt, 14)
+else:
+    tend = 2 * env.save_step * args.dt if args.test_run else args.tend
+time_opts = Time(dt=args.dt, Tend=tend, split_algo="LieTrotter")
 
 # Geometry
 a, R0 = 1.0, 10.0
@@ -325,7 +368,19 @@ bcs_eta1 = ("dirichlet", "dirichlet") if args.b_space == "Hdiv" else ("free", "f
 derham_opts = DerhamOptions(degree=tuple(args.degree), bcs=(bcs_eta1, None, None))
 
 # Profiling options
-profiling_opts = ProfilingOptions(use_line_profiler=False)
+if profiling:
+    from maybempi import MPI, SerialMPI
+
+    # scope-profiler run label, the name of the run in the comparison plots of the profiling-data page
+    num_ranks = 1 if isinstance(MPI, SerialMPI) else MPI.COMM_WORLD.Get_size()
+    profiling_opts = ProfilingOptions(
+        label=f"{num_ranks} rank"
+        + ("s" if num_ranks != 1 else "")
+        + (f" ({args.num_clones} clones)" if args.num_clones > 1 else ""),
+        use_line_profiler=False,
+    )
+else:
+    profiling_opts = ProfilingOptions(use_line_profiler=False)
 
 # Simulation object
 sim = Simulation(
@@ -384,20 +439,36 @@ use_filter = {"fourier": "fourier_in_tor", "hybrid": "hybrid", "three_point": "t
 # the logical toroidal mode number 1 is the physical n = 6 (tor_period = 6)
 filter_params = FilterParameters(use_filter=use_filter, modes=(1,))
 props = model.propagators
+# the pushers see the parallel magnetic perturbation through the same filter as the deposits (energy conservation)
 if args.drift_algo == "rk4":
-    props.push_bxe.options = props.push_bxe.Options(algo="explicit", butcher=ButcherTableau(algo="rk4"))
+    props.push_bxe.options = props.push_bxe.Options(
+        algo="explicit", butcher=ButcherTableau(algo="rk4"), filter_params=filter_params
+    )
 else:
-    props.push_bxe.options = props.push_bxe.Options(algo=args.drift_algo)
+    props.push_bxe.options = props.push_bxe.Options(algo=args.drift_algo, filter_params=filter_params)
 if args.parallel_algo == "rk4":
-    props.push_parallel.options = props.push_parallel.Options(algo="explicit", butcher=ButcherTableau(algo="rk4"))
+    props.push_parallel.options = props.push_parallel.Options(
+        algo="explicit", butcher=ButcherTableau(algo="rk4"), filter_params=filter_params
+    )
 else:
-    props.push_parallel.options = props.push_parallel.Options(algo=args.parallel_algo)
-props.shear_alf.options = props.shear_alf.Options(filter_params=filter_params)
-props.cc5d_gradb.options = props.cc5d_gradb.Options(filter_params=filter_params)
+    props.push_parallel.options = props.push_parallel.Options(algo=args.parallel_algo, filter_params=filter_params)
+# with --setup profiling, the solver iterations of each step are logged (read by the pproc script)
+props.shear_alf.options = props.shear_alf.Options(
+    filter_params=filter_params, solver_params=SolverParameters(info=profiling)
+)
+props.cc5d_gradb.options = props.cc5d_gradb.Options(
+    filter_params=filter_params, solver_params=SolverParameters(info=profiling)
+)
 # (CurrentCoupling5DDensity accumulates no vector: nothing to filter)
-props.cc5d_curlb.options = props.cc5d_curlb.Options(filter_params=filter_params)
+props.cc5d_density.options = props.cc5d_density.Options(solver_params=SolverParameters(info=profiling))
+props.cc5d_curlb.options = props.cc5d_curlb.Options(
+    filter_params=filter_params, solver_params=SolverParameters(info=profiling)
+)
 if args.magnetosonic_cross_b0:
     props.magnetosonic.options = props.magnetosonic.Options()
+else:
+    props.bg_current.options = props.bg_current.Options(solver_params=SolverParameters(info=profiling))
+    props.sound.options = props.sound.Options(solver_params=SolverParameters(info=profiling))
 
 # ------------------
 # Initial conditions
