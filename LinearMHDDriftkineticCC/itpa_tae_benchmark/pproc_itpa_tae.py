@@ -11,6 +11,16 @@ are saved. A frequency off by more than 10% or, with a filter, a non-positive gr
 folder of the run with ``--filter none``), the MHD kinetic energy and its part outside the toroidal harmonic n = 6 of
 both runs are overlaid in ``filter_comparison.png``. Figures are written into ``<path_out>/results``. The energy and
 harmonics plots use plasma-plots (``pip install "struphy[pproc]"``).
+
+Unless ``--no-frames``, the frames of three videos of the radial velocity u_r over the run (at most ``--max-frames``
+saved time steps) are written into ``<path_out>/results/frames/``: ``u_r_rz`` (the poloidal plane), ``u_r_3d_cut``
+(3D, the camera on the poloidal cross-section of the cutaway) and ``u_r_3d`` (3D, the whole torus with the
+cutaway), see ``struphy.post_processing.frames``. Make a video e.g. with
+``ffmpeg -framerate 25 -i frame_%04d.png -pix_fmt yuv420p u_r_rz.mp4`` in a frames folder.
+
+With ``--save-results`` (passed by ``submit_LinearMHDDriftkineticCC_scaling.py`` after each profiling run,
+``--setup profiling``) the scope-profiler HTML report and a summary of the cost per step and of the solver iterations
+are written into ``<path_out>/results`` instead of the plots.
 """
 
 import argparse
@@ -22,7 +32,9 @@ import numpy as np
 from matplotlib import pyplot as plt
 
 from struphy import Output
+from struphy.post_processing.frames import write_videos
 from struphy.post_processing.plot_3d import plot_field_3d
+from struphy.post_processing.profiling import save_profiling_results
 from struphy.post_processing.slices import plot_physical_slices
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -270,7 +282,7 @@ def finish(figs, results_dir, save_figs):
             plt.close(fig)
 
 
-def main(path_out=None, save_figs=True, compare=None, fit_window=FIT_WINDOW):
+def main(path_out=None, save_figs=True, compare=None, fit_window=FIT_WINDOW, frames=True, max_frames=500):
     path_out = DEFAULT_OUTPUT if path_out is None else path_out
     run = Output(path_out)
     snapshots = run.standard_snapshots()
@@ -361,6 +373,24 @@ def main(path_out=None, save_figs=True, compare=None, fit_window=FIT_WINDOW):
             else:
                 print(f"No 3D view of {species}/{variable}: its basis {basis!r} is not in the VTK files.")
 
+    if frames:
+        # frames of videos of the radial velocity u_r (the first component in the normalized basis, radial for the
+        # circular flux surfaces of the HollowTorus): the poloidal plane and two 3D views, at most max_frames saved
+        # time steps, in <path_out>/results/frames/u_r_rz, u_r_3d_cut and u_r_3d (frame_*.png)
+        videos = write_videos(
+            run,
+            "mhd/velocity",
+            os.path.join(results_dir, "frames"),
+            component=0,
+            basis="norm",
+            prefix="u_r",
+            label="radial velocity u_r",
+            max_frames=max_frames,
+        )
+        for video, files in videos.items():
+            if files:  # (empty on the ranks other than 0)
+                print(f"{len(files)} frames of {video} in {os.path.join(results_dir, 'frames', video)}")
+
     if not save_figs:
         plt.show()
 
@@ -376,6 +406,34 @@ def main(path_out=None, save_figs=True, compare=None, fit_window=FIT_WINDOW):
         # without filter, the marker noise may dominate the MHD kinetic energy
         if args.filter != "none":
             assert gamma > 0.0, f"The TAE does not grow (gamma = {gamma:.4g})."
+
+
+def save_results(path_out):
+    """Write the scope-profiler report and the summary of the cost per step and of the solver iterations into
+    ``<path_out>/results`` (:func:`struphy.post_processing.profiling.save_profiling_results`)."""
+    info = {
+        "num_elements": list(args.num_elements),
+        "degree": list(args.degree),
+        "b_space": args.b_space,
+        "projected": args.projected,
+        "a1": args.a1,
+        "Np": args.Np,
+        "num_clones": args.num_clones,
+        "filter": args.filter,
+        "drift_algo": args.drift_algo,
+        "parallel_algo": args.parallel_algo,
+        "dt": args.dt,
+    }
+    summary = save_profiling_results(path_out, info=info)
+    step_times = summary["step_times"]
+    iterations = ", ".join(
+        f"{mean:.1f} iterations per call ({name})" for name, mean in summary["solver_iterations_mean"].items()
+    )
+    print(
+        f"\nstep: median {1e3 * summary['step_median']:.3f} ms (first step {1e3 * step_times[0]:.3f} ms)"
+        + (f"; {iterations}" if iterations else "")
+    )
+    Output(path_out).profile.results.print_summary(include=["^prop: "], sort="total", title="propagators")
 
 
 def cli():
@@ -403,10 +461,26 @@ def cli():
         help="Time window of the frequency and growth rate fits (default: %(default)s).",
     )
     pproc_parser.add_argument("--show", action="store_true", help="Show the figures instead of saving them.")
+    pproc_parser.add_argument("--no-frames", action="store_true", help="Do not write the frames of the videos.")
+    pproc_parser.add_argument(
+        "--max-frames", type=int, default=500, help="Largest number of frames per video (default: 500)."
+    )
+    pproc_parser.add_argument(
+        "--save-results",
+        action="store_true",
+        help="Write the profiling results (scope-profiler report, cost summary) instead of the plots.",
+    )
     pproc_args = pproc_parser.parse_args(other_flags)
+    if pproc_args.save_results and args.setup != "profiling":
+        pproc_parser.error("--save-results needs the run's --setup profiling")
+    if pproc_args.save_results:
+        save_results(pproc_args.path_out)
+        return
     main(
         pproc_args.path_out,
         save_figs=not pproc_args.show,
         compare=pproc_args.compare,
         fit_window=tuple(pproc_args.fit_window),
+        frames=not pproc_args.no_frames,
+        max_frames=pproc_args.max_frames,
     )
